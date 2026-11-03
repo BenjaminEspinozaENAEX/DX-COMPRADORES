@@ -246,7 +246,7 @@ if "app_password" in st.secrets:
         if st.button("Ingresar"):
             if clave_ingresada == st.secrets["app_password"]:
                 st.session_state["_autenticado"] = True
-                loaders._descargar_onedrive.clear()
+                loaders.limpiar_cache_descargas()
                 st.session_state.pop("_clave_pipeline", None)
                 st.rerun()
             else:
@@ -273,13 +273,21 @@ with tab_dx:
 
         archivo_data = archivo_resp_grupo = archivo_centro = archivo_mrp = None
         if modo == "OneDrive (automático)":
-            archivo_data = URLS_SHAREPOINT["me5a"]
-            archivo_resp_grupo = URLS_SHAREPOINT["responsable_grupo"]
-            archivo_centro = URLS_SHAREPOINT["centro_sociedad"]
-            archivo_mrp = URLS_SHAREPOINT["responsable_mrp"]
+            # Los enlaces se leen desde Streamlit Secrets [onedrive].
+            # Si un enlace expira, basta con pegar el nuevo en Secrets (sin tocar GitHub).
+            claves = ["me5a", "responsable_grupo", "centro_sociedad", "responsable_mrp"]
+            secretos_od = st.secrets.get("onedrive", {})
+            fuentes = {
+                k: (f"onedrive:{k}" if k in secretos_od else URLS_SHAREPOINT[k])
+                for k in claves
+            }
+            archivo_data = fuentes["me5a"]
+            archivo_resp_grupo = fuentes["responsable_grupo"]
+            archivo_centro = fuentes["centro_sociedad"]
+            archivo_mrp = fuentes["responsable_mrp"]
 
             if st.button("🔄 Forzar recarga desde OneDrive ahora"):
-                loaders._descargar_onedrive.clear()
+                loaders.limpiar_cache_descargas()
                 st.session_state.pop("_clave_pipeline", None)
                 st.rerun()
 
