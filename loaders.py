@@ -57,7 +57,25 @@ def _descargar_url(url: str) -> bytes:
     session = requests.Session()
     resp = session.get(url_directa, headers=headers, timeout=60, allow_redirects=True)
     resp.raise_for_status()
-    return resp.content
+    contenido = resp.content
+
+    # Un .xlsx es un ZIP (empieza con b"PK") y un .parquet empieza con b"PAR1".
+    # Si SharePoint devuelve otra cosa (página de login, "enlace caducado",
+    # "acceso denegado"), lanzamos un error claro. Al lanzar la excepción,
+    # st.cache_data NO guarda la respuesta mala y el próximo intento vuelve a descargar.
+    if not (contenido[:2] == b"PK" or contenido[:4] == b"PAR1"):
+        tipo = resp.headers.get("Content-Type", "desconocido")
+        inicio = contenido[:300].decode("utf-8", errors="ignore").lower()
+        if "sign in" in inicio or "login" in inicio or "iniciar sesi" in resp.url.lower() or "login" in resp.url.lower():
+            motivo = "SharePoint pidió iniciar sesión (el enlace ya no es público o cambió su permiso)."
+        else:
+            motivo = "SharePoint devolvió una página web en vez del archivo Excel."
+        raise ValueError(
+            f"{motivo} Content-Type: {tipo}. URL final: {resp.url[:120]}... "
+            "Abre el enlace en una ventana de incógnito para verificar que siga "
+            "descargando el archivo sin pedir login."
+        )
+    return contenido
 
 @st.cache_data(show_spinner="Descargando desde secrets OneDrive...", ttl=3600, max_entries=4)
 def _descargar_onedrive(nombre_secreto: str) -> bytes:
@@ -73,6 +91,75 @@ def _descargar_onedrive(nombre_secreto: str) -> bytes:
     url = st.secrets["onedrive"][nombre_secreto]
     return _descargar_url(url)
 
+# ---- Carga automática vía Microsoft Graph API (no depende de enlaces que expiran) ----
+GRAPH_SENTINEL_PREFIX = "graph:"
+
+
+def graph_configurado() -> bool:
+    """True si en st.secrets existe la sección [graph] con lo necesario."""
+    try:
+        g = st.secrets["graph"]
+        return all(k in g for k in ("tenant_id", "client_id", "client_secret", "usuario")) and "archivos" in g
+    except Exception:
+        return False
+
+
+@st.cache_data(show_spinner=False, ttl=3000)
+def _token_graph(tenant_id: str, client_id: str, client_secret: str) -> str:
+    """Obtiene un token de aplicación (client credentials). Dura ~60 min; se renueva solo."""
+    resp = requests.post(
+        f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token",
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": "https://graph.microsoft.com/.default",
+            "grant_type": "client_credentials",
+        },
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"No se pudo obtener token de Microsoft Graph ({resp.status_code}): {resp.text[:300]}")
+    return resp.json()["access_token"]
+
+
+@st.cache_data(show_spinner="Descargando archivo desde OneDrive (Graph API)...", ttl=3600, max_entries=10)
+def _descargar_graph(clave_archivo: str) -> bytes:
+    """
+    Descarga un archivo del OneDrive del usuario configurado, por su ruta.
+    La ruta se define en st.secrets["graph"]["archivos"][clave_archivo],
+    relativa a la raíz del OneDrive (ej: "Reportes/DX/ME5A_con_Ariba.xlsx").
+    """
+    from urllib.parse import quote
+
+    g = st.secrets["graph"]
+    if clave_archivo not in g["archivos"]:
+        raise KeyError(f"Falta graph.archivos.{clave_archivo} en los Secrets de Streamlit.")
+    ruta = g["archivos"][clave_archivo].strip("/")
+    token = _token_graph(g["tenant_id"], g["client_id"], g["client_secret"])
+
+    url = (
+        f"https://graph.microsoft.com/v1.0/users/{quote(g['usuario'])}"
+        f"/drive/root:/{quote(ruta)}:/content"
+    )
+    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=120, allow_redirects=True)
+    if resp.status_code == 404:
+        raise FileNotFoundError(f"Graph no encontró '{ruta}' en el OneDrive de {g['usuario']}. Revisa la ruta en Secrets.")
+    if resp.status_code in (401, 403):
+        raise PermissionError(
+            f"Graph negó el acceso ({resp.status_code}). Revisa que la app de Azure tenga el permiso "
+            "de aplicación Files.Read.All con consentimiento de administrador."
+        )
+    resp.raise_for_status()
+    _validar_binario(resp.content, f"Graph:{ruta}")
+    return resp.content
+
+
+def _validar_binario(contenido: bytes, origen: str) -> None:
+    """Verifica que lo descargado sea un .xlsx (ZIP, 'PK') o un .parquet ('PAR1')."""
+    if not (contenido[:2] == b"PK" or contenido[:4] == b"PAR1"):
+        raise ValueError(f"Lo descargado desde {origen} no es un Excel/Parquet válido.")
+
+
 def _resolver_fuente(archivo):
     """
     Acepta URLs directas (http/https), el sentinel 'onedrive:<nombre_secreto>',
@@ -82,6 +169,8 @@ def _resolver_fuente(archivo):
         if archivo.startswith(("http://", "https://")):
             contenido = _descargar_url(archivo)
             return io.BytesIO(contenido)
+        if archivo.startswith(GRAPH_SENTINEL_PREFIX):
+            return io.BytesIO(_descargar_graph(archivo[len(GRAPH_SENTINEL_PREFIX):]))
         if archivo.startswith(ONEDRIVE_SENTINEL_PREFIX):
             nombre_secreto = archivo[len(ONEDRIVE_SENTINEL_PREFIX):]
             contenido = _descargar_onedrive(nombre_secreto)
@@ -138,11 +227,11 @@ def cargar_data_pr(ruta: str = None) -> pd.DataFrame:
         return pd.read_parquet(fuente)
 
     try:
-        df = pd.read_excel(fuente, sheet_name="Data")
+        df = pd.read_excel(fuente, sheet_name="Data", engine="openpyxl")
     except Exception:
         if hasattr(fuente, "seek"):
             fuente.seek(0)
-        df = pd.read_excel(fuente, sheet_name=0)
+        df = pd.read_excel(fuente, sheet_name=0, engine="openpyxl")
 
     return _tipar_data_pr(df)
 
@@ -150,7 +239,7 @@ def cargar_data_pr(ruta: str = None) -> pd.DataFrame:
 def cargar_responsable_grupo_compras(ruta: str = None) -> pd.DataFrame:
     """Equivalente a 'Responsable por Grupo de Compras' (lista de SharePoint)."""
     ruta = ruta or config.RUTA_RESP_GRUPO_COMPRAS
-    df = pd.read_excel(_resolver_fuente(ruta))
+    df = pd.read_excel(_resolver_fuente(ruta), engine="openpyxl")
     df = _columnas_normalizadas(df)
     df = df.rename(columns={"Responsable.title": "Comprador por Grupo Compras"})
     _requerir_columna(df, "Grupo de Compras", "Responsable_Grupo_Compras.xlsx")
@@ -162,7 +251,7 @@ def cargar_responsable_grupo_compras(ruta: str = None) -> pd.DataFrame:
 def cargar_centro_sociedad_mro(ruta: str = None) -> pd.DataFrame:
     """Equivalente a 'CENTRO_SOCIEDAD Compras MRO'."""
     ruta = ruta or config.RUTA_CENTRO_SOCIEDAD
-    df = pd.read_excel(_resolver_fuente(ruta))
+    df = pd.read_excel(_resolver_fuente(ruta), engine="openpyxl")
     df = _columnas_normalizadas(df)
     _requerir_columna(df, "Título", "Centro_Sociedad_MRO.xlsx")
     _requerir_columna(df, "Nombre Centro", "Centro_Sociedad_MRO.xlsx")
@@ -174,10 +263,18 @@ def cargar_centro_sociedad_mro(ruta: str = None) -> pd.DataFrame:
 def cargar_responsable_mrp(ruta: str = None) -> pd.DataFrame:
     """Equivalente a 'Responsable de MRP'."""
     ruta = ruta or config.RUTA_RESP_MRP
-    df = pd.read_excel(_resolver_fuente(ruta))
+    df = pd.read_excel(_resolver_fuente(ruta), engine="openpyxl")
     df = _columnas_normalizadas(df)
     df = df.rename(columns={"Responsable Compra.title": "Responsable de MRP.Responsable Compra.title"})
     _requerir_columna(df, "Title", "Responsable_MRP.xlsx")
     _requerir_columna(df, "Responsable de MRP.Responsable Compra.title", "Responsable_MRP.xlsx (columna 'Responsable Compra.title')")
     df["Title"] = df["Title"].astype(str).str.strip()
     return df[["Title", "Responsable de MRP.Responsable Compra.title"]]
+
+
+def limpiar_cache_descargas() -> None:
+    """Borra TODAS las cachés de descarga y carga, para forzar una lectura fresca."""
+    for fn in (_descargar_url, _descargar_onedrive, _descargar_graph, _token_graph, cargar_data_pr,
+               cargar_responsable_grupo_compras, cargar_centro_sociedad_mro,
+               cargar_responsable_mrp):
+        fn.clear()
